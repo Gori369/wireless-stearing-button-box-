@@ -1,1 +1,332 @@
 
+#include <BleGamepad.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
+
+// =====================================================
+// BLE GAMEPAD
+// =====================================================
+
+BleGamepad bleGamepad("STEARING BUTTONS", "ESP32", 100);
+
+BleGamepadConfiguration config;
+
+// =====================================================
+// BUTTON PINS
+// =====================================================
+
+// GPIO 32 = Button 1 + Deep Sleep Wake
+// GPIO 25 = Button 2 + Deep Sleep Wake
+// GPIO 26 = Button 3
+// GPIO 33 = Button 4
+// GPIO 4  = Button 5
+// GPIO 5  = Button 6 (Toggle, HIGH = pressed)
+// GPIO 18 = Button 7 (Toggle, HIGH = pressed)
+// GPIO 21 = Button 8
+// GPIO 22 = Button 9
+// GPIO 23 = Button 10
+// GPIO 19 = Button 11
+// GPIO 15 = Button 12
+
+const int buttonPins[] = {
+  32, 25, 26, 33, 4, 5,
+  18, 21, 22, 23, 19, 15
+};
+
+const int BUTTON_COUNT = 12;
+
+// =====================================================
+// POTENTIOMETER PINS
+// =====================================================
+
+const int potPins[] = {
+  12, 13, 14, 27
+};
+
+const int POT_COUNT = 4;
+
+// =====================================================
+// DEEP SLEEP SETTINGS
+// =====================================================
+
+// 25 minutes without activity
+const unsigned long SLEEP_TIMEOUT =
+  25UL * 60UL * 1000UL;
+
+// Pot movement threshold for activity detection
+const int POT_ACTIVITY_THRESHOLD = 100;
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+bool lastButtonState[BUTTON_COUNT] = {false};
+
+int potRaw[POT_COUNT] = {0};
+int lastPotReport[POT_COUNT] = {0};
+int potActivityBase[POT_COUNT] = {0};
+
+unsigned long lastActivityTime = 0;
+
+// =====================================================
+// READ BUTTON STATE
+// =====================================================
+
+bool readButton(int pin) {
+
+  // Wake buttons: GPIO 32 and GPIO 25
+  // Button connects GPIO to 3.3V
+  if (pin == 32 || pin == 25) {
+    return digitalRead(pin) == HIGH;
+  }
+
+  // Toggle switches: HIGH means pressed
+  if (pin == 5 || pin == 18) {
+    return digitalRead(pin) == HIGH;
+  }
+
+  // Other buttons connect GPIO to GND
+  // INPUT_PULLUP: LOW means pressed
+  return digitalRead(pin) == LOW;
+}
+
+// =====================================================
+// POTENTIOMETER READING
+// =====================================================
+
+int readPot(int pin) {
+  return analogRead(pin);
+}
+
+// =====================================================
+// CONVERT POT VALUE TO GAMEPAD AXIS
+// =====================================================
+
+int potToAxis(int value) {
+  return map(value, 0, 4095, 0, 32767);
+}
+
+// =====================================================
+// DEEP SLEEP
+// =====================================================
+
+void enterDeepSleep() {
+
+  Serial.println();
+  Serial.println("Entering Deep Sleep...");
+  Serial.println("Wake using GPIO 32 OR GPIO 25");
+
+  // Configure GPIO 32 as RTC input with pull-down
+  rtc_gpio_init(GPIO_NUM_32);
+  rtc_gpio_set_direction(
+    GPIO_NUM_32, RTC_GPIO_MODE_INPUT_ONLY
+  );
+  rtc_gpio_pulldown_en(GPIO_NUM_32);
+  rtc_gpio_pullup_dis(GPIO_NUM_32);
+
+  // Configure GPIO 25 as RTC input with pull-down
+  rtc_gpio_init(GPIO_NUM_25);
+  rtc_gpio_set_direction(
+    GPIO_NUM_25, RTC_GPIO_MODE_INPUT_ONLY
+  );
+  rtc_gpio_pulldown_en(GPIO_NUM_25);
+  rtc_gpio_pullup_dis(GPIO_NUM_25);
+
+  // Either GPIO 32 OR GPIO 25 can wake ESP32
+  uint64_t wakeMask =
+    (1ULL << 32) | (1ULL << 25);
+
+  esp_err_t result = esp_sleep_enable_ext1_wakeup(
+    wakeMask,
+    ESP_EXT1_WAKEUP_ANY_HIGH
+  );
+
+  if (result != ESP_OK) {
+    Serial.println("Wake-up configuration failed!");
+    Serial.println("Deep Sleep cancelled.");
+    return;
+  }
+
+  Serial.println("Wake-up configured successfully.");
+
+  Serial.flush();
+  delay(100);
+
+  esp_deep_sleep_start();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println();
+  Serial.println("ESP32 BLE Gamepad Starting...");
+
+  // ---------------------------------------------------
+  // Configure Buttons
+  // ---------------------------------------------------
+
+  for (int i = 0; i < BUTTON_COUNT; i++) {
+
+    int pin = buttonPins[i];
+
+    // Wake buttons use pull-down and HIGH = pressed
+    if (pin == 32 || pin == 25) {
+      pinMode(pin, INPUT_PULLDOWN);
+    }
+
+    // Toggle switches use HIGH = pressed
+    else if (pin == 5 || pin == 18) {
+      pinMode(pin, INPUT_PULLDOWN);
+    }
+
+    // Normal buttons use pull-up and LOW = pressed
+    else {
+      pinMode(pin, INPUT_PULLUP);
+    }
+
+    // Start unpressed so a held wake button can
+    // be detected after boot
+    lastButtonState[i] = false;
+  }
+
+  // ---------------------------------------------------
+  // Configure Potentiometers
+  // ---------------------------------------------------
+
+  for (int i = 0; i < POT_COUNT; i++) {
+
+    pinMode(potPins[i], INPUT);
+
+    potRaw[i] = readPot(potPins[i]);
+
+    lastPotReport[i] = potRaw[i];
+    potActivityBase[i] = potRaw[i];
+  }
+
+  // ---------------------------------------------------
+  // BLE Gamepad Configuration
+  // ---------------------------------------------------
+
+  config.setButtonCount(16);
+  config.setHatSwitchCount(4);
+  config.setAutoReport(false);
+  config.setControllerType(CONTROLLER_TYPE_GAMEPAD);
+
+  bleGamepad.begin(&config);
+
+  lastActivityTime = millis();
+
+  Serial.println("BLE Gamepad initialized.");
+  Serial.println("GPIO 32 = Button 1 / Wake");
+  Serial.println("GPIO 25 = Button 2 / Wake");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  bool reportNeeded = false;
+
+  // ---------------------------------------------------
+  // READ ALL BUTTONS
+  // ---------------------------------------------------
+
+  for (int i = 0; i < BUTTON_COUNT; i++) {
+
+    bool currentState = readButton(buttonPins[i]);
+
+    // Button state changed
+    if (currentState != lastButtonState[i]) {
+
+      lastActivityTime = millis();
+
+      // Button numbers start at 1
+      uint8_t gamepadButton = i + 1;
+
+      if (currentState) {
+        bleGamepad.press(gamepadButton);
+        Serial.print("Button pressed: ");
+        Serial.println(gamepadButton);
+      }
+      else {
+        bleGamepad.release(gamepadButton);
+        Serial.print("Button released: ");
+        Serial.println(gamepadButton);
+      }
+
+      lastButtonState[i] = currentState;
+      reportNeeded = true;
+    }
+  }
+
+  // ---------------------------------------------------
+  // READ POTENTIOMETERS
+  // ---------------------------------------------------
+
+  for (int i = 0; i < POT_COUNT; i++) {
+
+    int currentValue = readPot(potPins[i]);
+
+    // Meaningful movement resets sleep timer
+    if (abs(currentValue - potActivityBase[i]) >=
+        POT_ACTIVITY_THRESHOLD) {
+
+      lastActivityTime = millis();
+      potActivityBase[i] = currentValue;
+    }
+
+    // Update axis when the reading changes
+    if (abs(currentValue - lastPotReport[i]) >= 5) {
+
+      potRaw[i] = currentValue;
+      lastPotReport[i] = currentValue;
+
+      reportNeeded = true;
+    }
+  }
+
+  // ---------------------------------------------------
+  // SEND GAMEPAD REPORT
+  // ---------------------------------------------------
+
+  if (bleGamepad.isConnected()) {
+
+    if (reportNeeded) {
+
+      int x  = potToAxis(potRaw[0]); // GPIO 12
+      int y  = potToAxis(potRaw[1]); // GPIO 13
+      int z  = potToAxis(potRaw[2]); // GPIO 14
+      int rx = potToAxis(potRaw[3]); // GPIO 27
+
+      bleGamepad.setAxes(
+        x, y, z, rx,
+        0, 0, 0, 0
+      );
+
+      bleGamepad.sendReport();
+    }
+  }
+
+  // ---------------------------------------------------
+  // DEEP SLEEP AFTER 25 MINUTES OF INACTIVITY
+  // ---------------------------------------------------
+
+  if (millis() - lastActivityTime >= SLEEP_TIMEOUT) {
+
+    enterDeepSleep();
+
+    // Reached only if sleep setup fails
+    lastActivityTime = millis();
+  }
+
+  delay(5);
+}
+
